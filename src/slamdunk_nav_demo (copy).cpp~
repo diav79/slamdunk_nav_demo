@@ -1,0 +1,486 @@
+#include <ros/ros.h>
+#include <geometry_msgs/Twist.h>
+#include <sensor_msgs/Joy.h>
+#include "std_msgs/String.h"
+#include "std_msgs/Empty.h"
+#include "std_msgs/Bool.h"
+#include "std_srvs/Empty.h"
+#include <stdio.h>
+#include <termios.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/time.h>
+
+#include <stdlib.h>
+#include <opencv2/opencv.hpp>
+#include "opencv2/highgui/highgui.hpp"
+#include "opencv2/imgproc/imgproc.hpp"
+
+#include <image_transport/image_transport.h>
+#include <image_transport/subscriber_filter.h>
+#include <message_filters/subscriber.h>
+#include <message_filters/synchronizer.h>
+#include <message_filters/sync_policies/exact_time.h>
+#include <message_filters/sync_policies/approximate_time.h>
+
+#include <geometry_msgs/TransformStamped.h>
+
+#include <geometry_msgs/Transform.h>
+
+#include <geometry_msgs/PoseStamped.h>
+
+#include <geometry_msgs/TransformStamped.h>
+
+#include <tf2_msgs/TFMessage.h>
+
+#include <opencv2/opencv.hpp>
+#include <message_filters/subscriber.h>
+#include <message_filters/synchronizer.h>
+#include <message_filters/sync_policies/exact_time.h>
+#include <sensor_msgs/Image.h>
+#include <opencv2/calib3d/calib3d.hpp>
+#include <opencv2/opencv.hpp>
+#include <cv_bridge/cv_bridge.h>
+#include <opencv2/calib3d/calib3d.hpp>
+#include <sensor_msgs/image_encodings.h>
+#include <nodelet/nodelet.h>
+
+#include <image_transport/image_transport.h>
+#include <image_transport/subscriber_filter.h>
+#include <message_filters/subscriber.h>
+#include <message_filters/synchronizer.h>
+#include <message_filters/sync_policies/exact_time.h>
+#include <message_filters/sync_policies/approximate_time.h>
+
+#include <image_geometry/stereo_camera_model.h>
+#include <opencv2/calib3d/calib3d.hpp>
+#include <cv_bridge/cv_bridge.h>
+
+#include <sensor_msgs/image_encodings.h>
+
+#include <ctime>
+#include <ratio>
+#include <chrono>
+#include <utility>
+#include <thread>
+#include <chrono>
+#include <functional>
+#include <atomic>
+
+#include <iostream>
+#include <string>
+
+#include <tf/transform_listener.h>
+
+#include <tf2_ros/transform_listener.h>
+
+#include <slamdunk_nav_demo/drift_msg.h>
+
+#include <slamdunk_nav_demo/dummy.h>
+
+#include <std_msgs/Header.h>
+
+#include <slamdunk_nav_demo/tf_stamped.h>
+
+#include <geometry_msgs/PointStamped.h>
+
+#include <tf/transform_listener.h>
+
+#include <tf2_ros/transform_listener.h>
+#include <tf/transform_broadcaster.h>
+// #include <tf/Transform.h>
+// #include <tf/transform_datatypes.h>
+#include <tf/transform_datatypes.h>
+
+using namespace cv;
+using namespace ros;
+using namespace std;
+using namespace std::chrono;
+// using namespace tf;
+using namespace std_msgs;
+using namespace sensor_msgs;
+using namespace message_filters;
+
+ros::Subscriber extra_sub_, move_sub_;
+ros::Publisher vel_pub_;
+ros::Publisher center_pub;
+ros::Publisher image_pub;
+
+// ros::NodeHandle nh_;
+// image_transport::ImageTransport it_(nh_);
+
+Rect findMinRect(const Mat1b& src)
+{
+    Mat1f W(src.rows, src.cols, float(0));
+    Mat1f H(src.rows, src.cols, float(0));
+
+    Rect maxRect(0,0,0,0);
+    float maxArea = 0.f;
+
+    for (int r = 0; r < src.rows; ++r)
+    {
+        for (int c = 0; c < src.cols; ++c)
+        {
+            if (src(r, c) == 0)
+            {
+                H(r, c) = 1.f + ((r>0) ? H(r-1, c) : 0);
+                W(r, c) = 1.f + ((c>0) ? W(r, c-1) : 0);
+            }
+
+            float minw = W(r,c);
+            for (int h = 0; h < H(r, c); ++h)
+            {
+                minw = min(minw, W(r-h, c));
+                float area = (h+1) * minw;
+                if (area > maxArea)
+                {
+                    maxArea = area;
+                    maxRect = Rect(Point(c - minw + 1, r - h), Point(c+1, r+1));
+                }
+            }
+        }
+    }
+
+    return maxRect;
+}
+
+
+RotatedRect largestRectInNonConvexPoly(const Mat1b& src)
+{
+    // Create a matrix big enough to not lose points during rotation
+    vector<Point> ptz;
+    findNonZero(src, ptz);
+    Rect bbox = boundingRect(ptz); 
+    int maxdim = max(bbox.width, bbox.height);
+    Mat1b work(2*maxdim, 2*maxdim, uchar(0));
+    src(bbox).copyTo(work(Rect(maxdim - bbox.width/2, maxdim - bbox.height / 2, bbox.width, bbox.height)));
+
+    // Store best data
+    Rect bestRect;
+    int bestAngle = 0;
+
+    // For each angle
+    for (int angle = 0; angle < 14; angle += 15)
+    {
+        // cout << angle << endl;
+
+        // Rotate the image
+        Mat R = getRotationMatrix2D(Point(maxdim,maxdim), angle, 1);
+        Mat1b rotated;
+        warpAffine(work, rotated, R, work.size());
+
+        // Keep the crop with the polygon
+        vector<Point> pts;
+        findNonZero(rotated, pts);
+        Rect box = boundingRect(pts);
+        Mat1b crop = rotated(box).clone();
+
+        // Invert colors
+        crop = ~crop; 
+
+        // Solve the problem: "Find largest rectangle containing only zeros in an binary matrix"
+        // http://stackoverflow.com/questions/2478447/find-largest-rectangle-containing-only-zeros-in-an-n%C3%97n-binary-matrix
+        Rect r = findMinRect(crop);
+
+        // If best, save result
+        if (r.area() > bestRect.area())
+        {
+            bestRect = r + box.tl();    // Correct the crop displacement
+            bestAngle = angle;
+        }
+    }
+
+    // Apply the inverse rotation
+    Mat Rinv = getRotationMatrix2D(Point(maxdim, maxdim), -bestAngle, 1);
+    vector<Point> rectPoints{bestRect.tl(), Point(bestRect.x + bestRect.width, bestRect.y), bestRect.br(), Point(bestRect.x, bestRect.y + bestRect.height)};
+    vector<Point> rotatedRectPoints;
+    transform(rectPoints, rotatedRectPoints, Rinv);
+
+    // Apply the reverse translations
+    for (int i = 0; i < rotatedRectPoints.size(); ++i)
+    {
+        rotatedRectPoints[i] += bbox.tl() - Point(maxdim - bbox.width / 2, maxdim - bbox.height / 2);
+    }
+
+    // Get the rotated rect
+    RotatedRect rrect = minAreaRect(rotatedRectPoints);
+
+    return rrect;
+}
+
+geometry_msgs::PointStamped pt;
+geometry_msgs::PointStamped pt_transformed;
+bool next_move = false;
+int thecount;
+
+void navCallback(const sensor_msgs::ImageConstPtr& depth_map, const sensor_msgs::ImageConstPtr& left_rgb_rect){
+
+  // next_move = false;
+
+  cv_bridge::CvImagePtr cv_ptr, cv_ptr_rect;
+
+  cv_ptr_rect = cv_bridge::toCvCopy(left_rgb_rect, "bgr8");
+
+  Mat1b img;
+
+  // Mat disp, disp_norm;
+
+  cv_ptr = cv_bridge::toCvCopy(depth_map);
+
+  // disp = imread("/home/diav/workspace/spsstereo/left_left_disparity.png");
+
+  // int channels = cv_ptr->image.channels();
+
+  // int nRows = cv_ptr->image.rows;
+  // int nCols = cv_ptr->image.cols * channels;
+
+  // if (cv_ptr->image.isContinuous())
+  // {
+  //     nCols *= nRows;
+  //     nRows = 1;
+  // }
+
+  // int r, c;
+  // float* p;
+
+  // for( r = 0; r < nRows; ++r)
+  // {
+  //     p = cv_ptr->image.ptr<float>(r);
+
+  //     for ( c = 0; c < nCols; ++c)
+  //     {
+  //         if (p[c] > 70)
+  //           p[c] = 70;
+  //     }
+  // }
+
+  // Mat dum;
+
+  normalize(cv_ptr->image, img, 0, 255, CV_MINMAX, CV_8UC1);
+  // normalize(disp, dum, 0, 255, CV_MINMAX, CV_8UC1);
+  // cvtColor(disp_norm, disp_norm, CV_RGB2GRAY);
+
+  // Mat dum = disp_norm;
+
+  // Mat1b img = disp_norm;
+
+  Mat dummy = Mat::zeros( img.size(), img.type() );
+
+  double thresh_value = cv::threshold(img, dummy, 0, 255, CV_THRESH_BINARY | CV_THRESH_OTSU);
+
+  cv::threshold(img, img, (thresh_value / 2), 255, CV_THRESH_BINARY);
+
+  // Mat sub_mat = Mat::ones(img.size(), img.type()) * 255;
+
+  //subtract the original matrix by sub_mat to give the negative output new_image
+  // subtract(Mat::ones(img.size(), img.type()) * 255, img, img);
+
+  int erosion_size = 5;  
+  Mat element = getStructuringElement(cv::MORPH_CROSS, cv::Size(2 * erosion_size + 1, 2 * erosion_size + 1), cv::Point(erosion_size, erosion_size) );
+
+  dilate(img, img, element);
+
+  // Show
+  // Mat3b res;
+  // cvtColor(img, res, COLOR_GRAY2BGR);
+
+  Point2f center;
+
+  // for(int round = 0; round < 1; round++) {
+
+      // Compute largest rect inside polygon
+      RotatedRect r = largestRectInNonConvexPoly(img);
+
+      Point2f points[4];
+      r.points(points);
+
+      for (int i = 0; i < 4; ++i)
+      {
+          line(cv_ptr_rect->image, points[i]*2, points[(i + 1) % 4]*2, Scalar(0, 0, 255), 2);
+          // line(dum, points[i], points[(i + 1) % 4], Scalar(0, 0, 255), 2);
+          // cout << points[i];
+      }
+
+      // rectangle(img, points[2], points[0], Scalar(0, 0, 0), -1);
+
+      center.x = (points[0].x + points[2].x) / 2.0;
+      center.y = (points[0].y + points[2].y) / 2.0;
+
+  // } 
+
+  std_msgs::String msg;
+  msg.data = std::to_string(center.x) + ',' + std::to_string(center.y);
+
+  center_pub.publish(msg);
+  image_pub.publish(cv_ptr_rect->toImageMsg());
+
+  // float b, d;
+  // float x, y, z;
+
+  // x = center.x;
+  // y = center.y;
+  // d = disp.at<uchar>(center.y, center.x);
+  // b = 20; //atof(baseline->data.c_str());
+  
+  // pt.header.frame_id = "ORB_SLAM/Camera"; //"camera_optical";
+  // const std::string target_frame = "ORB_SLAM/World"; //"odom";
+  // const std::string original_frame = "ORB_SLAM/Camera"; //"camera_optical";
+  // const ros::Time time = ros::Time(0);
+
+  // pt.point.z = 537.65 * b / d;
+  // z = pt.point.z;
+
+  // pt.point.x = (x - 421.003367) * z / 541.331258;
+  // pt.point.y = (y - 233.689062) * z / 534.057959;
+
+  // tf::TransformListener listener;
+  // listener.waitForTransform(target_frame, original_frame, time, ros::Duration(5.0));
+  // listener.transformPoint(target_frame, pt, pt_transformed);
+  
+  // cout << "\nCoordnites of next waypoint(in image): " << x << ", " << y << "\nDisparity: " << d << "\nBaseline(using ORB:) " << b << "\nThe desrination coordinates are(x, y, z): " << pt_transformed.point.x << " " << pt_transformed.point.y << " " << pt_transformed.point.z << "\n";
+
+  // next_move = true;
+  // thecount = 0;
+
+  // imwrite("result.png", res);
+  // imwrite("disp_norm.png", dum);
+
+  // imshow("disparity", dum);
+  // waitKey(1);
+
+}
+
+float dx, dy, dz, sx, sy, sz;
+int init_x, init_y;
+int no_move_count;
+
+// void moveCallback(const an_demo::tf_stampedConstPtr& theMove){
+
+//   geometry_msgs::Twist twist;
+
+//   twist.linear.x = 0;
+//   twist.linear.y = 0;
+//   twist.linear.z = 0;
+//   twist.angular.z = 0;
+
+//   if(thecount == 0){
+//     dz = theMove->trans.translation.z + (0.75 * (pt_transformed.point.z - theMove->trans.translation.z));
+//     dy = pt_transformed.point.y;
+//     dx = pt_transformed.point.x;
+//     // sx = (dx - pt_transformed.point.x) / 10.0;
+//     // sy = (dy - pt_transformed.point.y) / 10.0;
+//     // sz = (dz - pt_transformed.point.z) / 10.0;
+//     if(dy - theMove->trans.translation.y > 0) init_y = 0;
+//     else init_y = 1;
+//     if(dx - theMove->trans.translation.x > 0) init_x = 0;
+//     else init_x = 1;
+//     no_move_count = 0;
+//     // thecount++;
+
+//   }
+
+//   if(next_move){
+
+//     cout << "\ndestination_x: " << dx << " destination_y: " << dy << " destination_z: " << dz << " current_x: " << theMove->trans.translation.x << " current_y: " << theMove->trans.translation.y << " current_z: " << theMove->trans.translation.z;
+
+//     // if(dz - theMove->trans.translation.z > sz){
+//     //   twist.linear.x = 0.1;
+//     // }
+//     // if(dy - theMove->trans.translation.y > sy && init_y == 0){
+//     //   twist.linear.z = -0.03;
+//     // }
+//     // if(dy - theMove->trans.translation.y < sy && init_y == 1){
+//     //   twist.linear.z = 0.03;
+//     // }
+//     // if(dx - theMove->trans.translation.x > sx && init_x == 0){
+//     //   twist.linear.y = -0.03;
+//     // }
+//     // if(dx - theMove->trans.translation.x < sx && init_x == 1){
+//     //   twist.linear.y = 0.03;
+//     // }
+
+//     if((dz - theMove->trans.translation.z > 0)){
+      
+//       twist.linear.x = 0.05;
+//       // vel_pub_.publish(twist);
+//     }
+//     else{
+//       no_move_count++;
+//     }
+
+//     if(no_move_count < 10) {
+
+//       if((dy - theMove->trans.translation.y > 0)){
+        
+//         twist.linear.z = -0.05;
+//         // vel_pub_.publish(twist);
+//       }
+//       // if((dy - theMove->trans.translation.y < 0) && (init_y == 1) && (thecount % 2 == 0)){
+//       if((dy - theMove->trans.translation.y < 0)){
+        
+//         twist.linear.z = 0.05;
+//         // vel_pub_.publish(twist);
+//       }
+//       // if((dx - theMove->trans.translation.x > 0) && (init_x == 0) && (thecount % 2 == 1)){
+//       if((dx - theMove->trans.translation.x > 0)){
+//         twist.linear.y = -0.05;
+//         // vel_pub_.publish(twist);
+        
+//       }
+//       // if((dx - theMove->trans.translation.x < 0) && (init_x == 1) && (thecount % 2 == 1)){
+//       if((dx - theMove->trans.translation.x < 0)){
+//         twist.linear.y = 0.05;
+//         // vel_pub_.publish(twist);
+//       }
+//     }
+//   }
+
+//   vel_pub_.publish(twist);
+
+//   high_resolution_clock::time_point t3 = std::chrono::high_resolution_clock::now();
+//   duration<double> time_span_2;
+//   high_resolution_clock::time_point t4;
+
+//   while (time_span_2.count() < 0.3) {                    // set this
+
+//   t4 = high_resolution_clock::now();
+
+//   time_span_2 = duration_cast<duration<double> >(t4 - t3);
+
+//   }
+ 
+//   thecount++; 
+// }
+
+int main(int argc, char** argv)
+{
+  ros::init(argc, argv, "slamdunk_nav_demo");
+
+  ros::NodeHandle nh_;
+
+  // image_transport::ImageTransport it_(nh_);
+  // it_(nh_);
+
+  message_filters::Subscriber<Image> img_sub_depth(nh_, "/depth_map/image", 10);
+  message_filters::Subscriber<Image> img_sub_left_rect(nh_, "/left_rgb_rect/image_rect_color", 10);
+
+  typedef sync_policies::ApproximateTime<Image, Image> MySyncPolicy;
+
+  Synchronizer<MySyncPolicy> sync_1(MySyncPolicy(10), img_sub_depth, img_sub_left_rect);
+
+  sync_1.registerCallback(boost::bind(&navCallback, _1, _2));
+
+  center_pub = nh_.advertise<std_msgs::String>("center", 10);
+  image_pub = nh_.advertise<Image>("the_centered_rect", 10);
+
+
+  // extra_sub_ = nh_.subscribe<std_msgs::String>("/extra_command", 1, extraCallback);
+
+  // move_sub_ = nh_.subscribe<an_demo::tf_stamped>("/tf_stamped", 1, moveCallback);
+
+  // vel_pub_ = nh_.advertise<geometry_msgs::Twist>("bebop/cmd_vel", 1);
+
+  ros::spin();
+
+  return 0;
+}
