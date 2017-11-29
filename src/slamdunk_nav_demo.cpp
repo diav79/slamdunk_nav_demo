@@ -132,6 +132,7 @@ RotatedRect largestRectInNonConvexPoly(const Mat1b& src)
     return rrect;
 }
 
+// This is the synchronized callback that takes depth map and rectified left image from slamdunk.
 void dispCallback(const ImageConstPtr& depth_map, const ImageConstPtr& left_rgb_rect) {
 
   cv_bridge::CvImagePtr cv_ptr, cv_ptr_rect;
@@ -148,12 +149,18 @@ void dispCallback(const ImageConstPtr& depth_map, const ImageConstPtr& left_rgb_
   twist.linear.z = 0;
   twist.angular.z = 0;
 
+// Normalize depth map
+
   normalize(cv_ptr->image, img, 0, 255, CV_MINMAX, CV_8UC1);
 
   Mat dummy = Mat::zeros( img.size(), img.type() );
 
+// Threshold it for obstacle/free space segmentation
+
   double thresh_value = cv::threshold(img, dummy, 0, 255, CV_THRESH_BINARY | CV_THRESH_OTSU);
   cv::threshold(img, img, (thresh_value / 2), 255, CV_THRESH_BINARY);
+
+// Remove small error blobs
 
   int erosion_size = 3;  			// 5
   Mat element = getStructuringElement(cv::MORPH_CROSS, cv::Size(2 * erosion_size + 1, 2 * erosion_size + 1), cv::Point(erosion_size, erosion_size) );
@@ -174,6 +181,7 @@ void dispCallback(const ImageConstPtr& depth_map, const ImageConstPtr& left_rgb_
         // line(cv_ptr_rect->image, points[i]*3, points[(i + 1) % 4]*3, Scalar(0, 0, 255), 2);
       // }
 
+// Calculate center of the largest free space
       center.x = (points[0].x + points[2].x) / 2.0;
       center.y = (points[0].y + points[2].y) / 2.0;
       // std_msgs::String msg;
@@ -181,6 +189,8 @@ void dispCallback(const ImageConstPtr& depth_map, const ImageConstPtr& left_rgb_
     
     // rectangle(img, points[2], points[0], Scalar(0, 0, 0), -1);
     }
+
+// Set velocity commands according to the location of free space
     if(center.x < (cv_ptr->image.cols)/2.0){
 	twist.linear.y = 0.05;
     }
@@ -200,6 +210,8 @@ void dispCallback(const ImageConstPtr& depth_map, const ImageConstPtr& left_rgb_
     // center_pub.publish(msg);
     // image_pub.publish(cv_ptr_rect->toImageMsg());
   }
+
+// Publish the velocity commands
     vel_pub.publish(twist);
 
 
